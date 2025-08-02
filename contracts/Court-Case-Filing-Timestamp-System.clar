@@ -64,7 +64,11 @@
         (map-set case-index 
             {case-id: case-id} 
             {count: (+ current-count u1)})
-        (ok current-time)))
+        (if (is-eq current-count u0)
+            (begin
+                (unwrap-panic (update-search-indices case-id jurisdiction case-type status-pending))
+                (ok current-time))
+            (ok current-time))))
 (define-public (register-entity (entity principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
@@ -232,3 +236,112 @@
     (match (map-get? document-metadata {doc-hash: document-hash})
         doc-info (get is-verified doc-info)
         false))
+
+(define-constant err-invalid-search (err u110))
+(define-constant max-search-results u50)
+
+(define-map jurisdiction-cases
+    { jurisdiction: (string-ascii 32), jurisdiction-index: uint }
+    { case-id: (string-ascii 32) }
+)
+
+(define-map jurisdiction-index
+    { jurisdiction: (string-ascii 32) }
+    { count: uint }
+)
+
+(define-map case-type-cases
+    { case-type: (string-ascii 32), type-index: uint }
+    { case-id: (string-ascii 32) }
+)
+
+(define-map case-type-index
+    { case-type: (string-ascii 32) }
+    { count: uint }
+)
+
+(define-map status-cases
+    { status: (string-ascii 16), status-index: uint }
+    { case-id: (string-ascii 32) }
+)
+
+(define-map status-search-index
+    { status: (string-ascii 16) }
+    { count: uint }
+)
+
+(define-private (update-search-indices (case-id (string-ascii 32)) (jurisdiction (string-ascii 32)) (case-type (string-ascii 32)) (status (string-ascii 16)))
+    (let
+        ((jurisdiction-count (default-to u0 (get count (map-get? jurisdiction-index {jurisdiction: jurisdiction}))))
+         (type-count (default-to u0 (get count (map-get? case-type-index {case-type: case-type}))))
+         (status-count (default-to u0 (get count (map-get? status-search-index {status: status})))))
+        (map-set jurisdiction-cases
+            {jurisdiction: jurisdiction, jurisdiction-index: jurisdiction-count}
+            {case-id: case-id})
+        (map-set jurisdiction-index
+            {jurisdiction: jurisdiction}
+            {count: (+ jurisdiction-count u1)})
+        (map-set case-type-cases
+            {case-type: case-type, type-index: type-count}
+            {case-id: case-id})
+        (map-set case-type-index
+            {case-type: case-type}
+            {count: (+ type-count u1)})
+        (map-set status-cases
+            {status: status, status-index: status-count}
+            {case-id: case-id})
+        (map-set status-search-index
+            {status: status}
+            {count: (+ status-count u1)})
+        (ok true)))
+
+(define-read-only (search-by-jurisdiction (jurisdiction (string-ascii 32)) (limit uint) (offset uint))
+    (let
+        ((total-count (default-to u0 (get count (map-get? jurisdiction-index {jurisdiction: jurisdiction}))))
+         (search-limit (if (> limit max-search-results) max-search-results limit)))
+        (asserts! (< offset total-count) err-invalid-search)
+        (ok {
+            total: total-count,
+            limit: search-limit,
+            offset: offset
+        })))
+
+(define-read-only (get-jurisdiction-case (jurisdiction (string-ascii 32)) (index uint))
+    (map-get? jurisdiction-cases {jurisdiction: jurisdiction, jurisdiction-index: index}))
+
+(define-read-only (search-by-case-type (case-type (string-ascii 32)) (limit uint) (offset uint))
+    (let
+        ((total-count (default-to u0 (get count (map-get? case-type-index {case-type: case-type}))))
+         (search-limit (if (> limit max-search-results) max-search-results limit)))
+        (asserts! (< offset total-count) err-invalid-search)
+        (ok {
+            total: total-count,
+            limit: search-limit,
+            offset: offset
+        })))
+
+(define-read-only (get-case-type-case (case-type (string-ascii 32)) (index uint))
+    (map-get? case-type-cases {case-type: case-type, type-index: index}))
+
+(define-read-only (search-by-status (status (string-ascii 16)) (limit uint) (offset uint))
+    (let
+        ((total-count (default-to u0 (get count (map-get? status-search-index {status: status}))))
+         (search-limit (if (> limit max-search-results) max-search-results limit)))
+        (asserts! (< offset total-count) err-invalid-search)
+        (ok {
+            total: total-count,
+            limit: search-limit,
+            offset: offset
+        })))
+
+(define-read-only (get-status-case (status (string-ascii 16)) (index uint))
+    (map-get? status-cases {status: status, status-index: index}))
+
+(define-read-only (get-jurisdiction-count (jurisdiction (string-ascii 32)))
+    (get count (default-to {count: u0} (map-get? jurisdiction-index {jurisdiction: jurisdiction}))))
+
+(define-read-only (get-case-type-count (case-type (string-ascii 32)))
+    (get count (default-to {count: u0} (map-get? case-type-index {case-type: case-type}))))
+
+(define-read-only (get-status-count (status (string-ascii 16)))
+    (get count (default-to {count: u0} (map-get? status-search-index {status: status}))))
