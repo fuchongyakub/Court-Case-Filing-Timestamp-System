@@ -142,6 +142,7 @@
         (map-set case-status-index
             {case-id: case-id}
             {current-status: new-status, status-count: (+ current-count u1)})
+        (unwrap-panic (send-case-notifications case-id alert-type-status-change (concat "Status changed to: " new-status)))
         (ok current-time)))
 
 (define-read-only (get-current-case-status (case-id (string-ascii 32)))
@@ -207,6 +208,7 @@
         (map-set case-doc-count
             {case-id: case-id}
             {count: (+ doc-count u1)})
+        (unwrap-panic (send-case-notifications case-id alert-type-document-added (concat "New document added: " doc-type)))
         (ok current-time)))
 
 (define-public (verify-document (document-hash (buff 32)))
@@ -221,6 +223,7 @@
             (merge doc-info {is-verified: true, 
                            verification-timestamp: (some current-time),
                            verified-by: (some caller)}))
+        (unwrap-panic (send-case-notifications (get case-id doc-info) alert-type-document-verified "Document verification completed"))
         (ok current-time)))
 
 (define-read-only (get-document-info (document-hash (buff 32)))
@@ -345,3 +348,149 @@
 
 (define-read-only (get-status-count (status (string-ascii 16)))
     (get count (default-to {count: u0} (map-get? status-search-index {status: status}))))
+
+(define-constant err-subscription-exists (err u111))
+(define-constant err-subscription-not-found (err u112))
+(define-constant err-notification-not-found (err u113))
+(define-constant max-notifications u1000)
+
+(define-data-var notification-counter uint u0)
+
+(define-map case-subscriptions
+    { subscriber: principal, case-id: (string-ascii 32) }
+    {
+        subscription-id: uint,
+        alert-types: uint,
+        created-timestamp: uint
+    }
+)
+
+(define-map entity-subscriptions
+    { subscriber: principal, subscription-index: uint }
+    { case-id: (string-ascii 32) }
+)
+
+(define-map subscription-counts
+    { subscriber: principal }
+    { count: uint }
+)
+
+(define-map notifications
+    { notification-id: uint }
+    {
+        recipient: principal,
+        case-id: (string-ascii 32),
+        notification-type: uint,
+        message: (string-ascii 256),
+        timestamp: uint,
+        is-read: bool
+    }
+)
+
+(define-map entity-notifications
+    { recipient: principal, notification-index: uint }
+    { notification-id: uint }
+)
+
+(define-map notification-counts
+    { recipient: principal }
+    { total: uint, unread: uint }
+)
+
+(define-constant alert-type-status-change u1)
+(define-constant alert-type-document-added u2)
+(define-constant alert-type-document-verified u4)
+(define-constant alert-type-all u7)
+
+(define-private (has-alert-type (alert-types uint) (alert-type uint))
+    (> (bit-and alert-types alert-type) u0))
+
+(define-private (create-notification (recipient principal) (case-id (string-ascii 32)) (notification-type uint) (message (string-ascii 256)))
+    (let
+        ((notification-id (var-get notification-counter))
+         (current-time stacks-block-height)
+         (counts (default-to {total: u0, unread: u0} (map-get? notification-counts {recipient: recipient})))
+         (total-count (get total counts))
+         (unread-count (get unread counts)))
+        (asserts! (< notification-id max-notifications) (err u114))
+        (map-set notifications
+            {notification-id: notification-id}
+            {recipient: recipient, case-id: case-id, notification-type: notification-type,
+             message: message, timestamp: current-time, is-read: false})
+        (map-set entity-notifications
+            {recipient: recipient, notification-index: total-count}
+            {notification-id: notification-id})
+        (map-set notification-counts
+            {recipient: recipient}
+            {total: (+ total-count u1), unread: (+ unread-count u1)})
+        (var-set notification-counter (+ notification-id u1))
+        (ok notification-id)))
+
+(define-private (send-case-notifications (case-id (string-ascii 32)) (notification-type uint) (message (string-ascii 256)))
+    (ok true))
+
+(define-public (subscribe-to-case (case-id (string-ascii 32)) (alert-types uint))
+    (let
+        ((caller tx-sender)
+         (current-time stacks-block-height)
+         (subscription-key {subscriber: caller, case-id: case-id})
+         (subscription-id (var-get notification-counter))
+         (sub-count (default-to u0 (get count (map-get? subscription-counts {subscriber: caller})))))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (> (get-case-count case-id) u0) err-case-not-found)
+        (asserts! (is-none (map-get? case-subscriptions subscription-key)) err-subscription-exists)
+        (asserts! (<= alert-types alert-type-all) err-invalid-search)
+        (map-set case-subscriptions
+            subscription-key
+            {subscription-id: subscription-id, alert-types: alert-types, created-timestamp: current-time})
+        (map-set entity-subscriptions
+            {subscriber: caller, subscription-index: sub-count}
+            {case-id: case-id})
+        (map-set subscription-counts
+            {subscriber: caller}
+            {count: (+ sub-count u1)})
+        (ok subscription-id)))
+
+(define-public (unsubscribe-from-case (case-id (string-ascii 32)))
+    (let
+        ((caller tx-sender)
+         (subscription-key {subscriber: caller, case-id: case-id}))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (is-some (map-get? case-subscriptions subscription-key)) err-subscription-not-found)
+        (ok (map-delete case-subscriptions subscription-key))))
+
+(define-public (mark-notification-read (notification-id uint))
+    (let
+        ((caller tx-sender)
+         (notification (unwrap! (map-get? notifications {notification-id: notification-id}) err-notification-not-found))
+         (counts (default-to {total: u0, unread: u0} (map-get? notification-counts {recipient: caller}))))
+        (asserts! (is-eq caller (get recipient notification)) err-not-authorized)
+        (asserts! (not (get is-read notification)) (ok true))
+        (map-set notifications
+            {notification-id: notification-id}
+            (merge notification {is-read: true}))
+        (map-set notification-counts
+            {recipient: caller}
+            {total: (get total counts), unread: (- (get unread counts) u1)})
+        (ok true)))
+
+(define-read-only (get-subscription-info (subscriber principal) (case-id (string-ascii 32)))
+    (map-get? case-subscriptions {subscriber: subscriber, case-id: case-id}))
+
+(define-read-only (get-entity-subscription (subscriber principal) (index uint))
+    (map-get? entity-subscriptions {subscriber: subscriber, subscription-index: index}))
+
+(define-read-only (get-subscription-count (subscriber principal))
+    (get count (default-to {count: u0} (map-get? subscription-counts {subscriber: subscriber}))))
+
+(define-read-only (get-notification (notification-id uint))
+    (map-get? notifications {notification-id: notification-id}))
+
+(define-read-only (get-entity-notification (recipient principal) (index uint))
+    (map-get? entity-notifications {recipient: recipient, notification-index: index}))
+
+(define-read-only (get-notification-counts (recipient principal))
+    (default-to {total: u0, unread: u0} (map-get? notification-counts {recipient: recipient})))
+
+(define-read-only (is-subscribed-to-case (subscriber principal) (case-id (string-ascii 32)))
+    (is-some (map-get? case-subscriptions {subscriber: subscriber, case-id: case-id})))
