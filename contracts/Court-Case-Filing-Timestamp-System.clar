@@ -494,3 +494,92 @@
 
 (define-read-only (is-subscribed-to-case (subscriber principal) (case-id (string-ascii 32)))
     (is-some (map-get? case-subscriptions {subscriber: subscriber, case-id: case-id})))
+
+(define-constant err-deadline-not-found (err u115))
+(define-constant err-deadline-exists (err u116))
+(define-constant max-deadlines-per-case u20)
+
+(define-constant deadline-type-filing "filing")
+(define-constant deadline-type-hearing "hearing")
+(define-constant deadline-type-response "response")
+(define-constant deadline-type-appeal "appeal")
+(define-constant deadline-type-discovery "discovery")
+
+(define-map case-deadlines
+    { case-id: (string-ascii 32), deadline-index: uint }
+    {
+        deadline-type: (string-ascii 32),
+        deadline-block: uint,
+        description: (string-ascii 256),
+        set-by: principal,
+        created-at: uint,
+        is-met: bool,
+        met-at: (optional uint)
+    }
+)
+
+(define-map case-deadline-counts
+    { case-id: (string-ascii 32) }
+    { count: uint }
+)
+
+(define-public (set-case-deadline
+    (case-id (string-ascii 32))
+    (deadline-type (string-ascii 32))
+    (deadline-block uint)
+    (description (string-ascii 256)))
+    (let
+        ((caller tx-sender)
+         (current-time stacks-block-height)
+         (deadline-count (default-to u0 (get count (map-get? case-deadline-counts {case-id: case-id})))))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (> (get-case-count case-id) u0) err-case-not-found)
+        (asserts! (< deadline-count max-deadlines-per-case) err-deadline-exists)
+        (asserts! (> deadline-block current-time) err-invalid-search)
+        (map-set case-deadlines
+            {case-id: case-id, deadline-index: deadline-count}
+            {deadline-type: deadline-type, deadline-block: deadline-block,
+             description: description, set-by: caller, created-at: current-time,
+             is-met: false, met-at: none})
+        (map-set case-deadline-counts
+            {case-id: case-id}
+            {count: (+ deadline-count u1)})
+        (ok deadline-count)))
+
+(define-public (mark-deadline-met
+    (case-id (string-ascii 32))
+    (deadline-index uint))
+    (let
+        ((caller tx-sender)
+         (current-time stacks-block-height)
+         (deadline-info (unwrap! (map-get? case-deadlines {case-id: case-id, deadline-index: deadline-index}) err-deadline-not-found)))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (not (get is-met deadline-info)) err-already-verified)
+        (map-set case-deadlines
+            {case-id: case-id, deadline-index: deadline-index}
+            (merge deadline-info {is-met: true, met-at: (some current-time)}))
+        (ok current-time)))
+
+(define-read-only (get-case-deadline (case-id (string-ascii 32)) (deadline-index uint))
+    (map-get? case-deadlines {case-id: case-id, deadline-index: deadline-index}))
+
+(define-read-only (get-case-deadline-count (case-id (string-ascii 32)))
+    (get count (default-to {count: u0} (map-get? case-deadline-counts {case-id: case-id}))))
+
+(define-read-only (is-deadline-expired (case-id (string-ascii 32)) (deadline-index uint))
+    (match (map-get? case-deadlines {case-id: case-id, deadline-index: deadline-index})
+        deadline-info
+            (if (get is-met deadline-info)
+                false
+                (>= stacks-block-height (get deadline-block deadline-info)))
+        false))
+
+(define-read-only (is-deadline-upcoming (case-id (string-ascii 32)) (deadline-index uint) (blocks-threshold uint))
+    (match (map-get? case-deadlines {case-id: case-id, deadline-index: deadline-index})
+        deadline-info
+            (let
+                ((blocks-until-deadline (- (get deadline-block deadline-info) stacks-block-height)))
+                (if (get is-met deadline-info)
+                    false
+                    (and (> blocks-until-deadline u0) (<= blocks-until-deadline blocks-threshold))))
+        false))
