@@ -583,3 +583,143 @@
                     false
                     (and (> blocks-until-deadline u0) (<= blocks-until-deadline blocks-threshold))))
         false))
+
+(define-constant err-access-denied (err u117))
+(define-constant err-permission-exists (err u118))
+(define-constant err-invalid-permission (err u119))
+
+(define-constant permission-view u1)
+(define-constant permission-edit u2)
+(define-constant permission-manage u4)
+(define-constant permission-full u7)
+
+(define-map case-access-control
+    { case-id: (string-ascii 32), entity: principal }
+    {
+        permissions: uint,
+        granted-by: principal,
+        granted-at: uint,
+        expires-at: (optional uint)
+    }
+)
+
+(define-map case-access-list
+    { case-id: (string-ascii 32), access-index: uint }
+    { entity: principal }
+)
+
+(define-map case-access-counts
+    { case-id: (string-ascii 32) }
+    { count: uint }
+)
+
+(define-map entity-case-access
+    { entity: principal, entity-access-index: uint }
+    { case-id: (string-ascii 32) }
+)
+
+(define-map entity-access-counts
+    { entity: principal }
+    { count: uint }
+)
+
+(define-private (has-permission (permissions uint) (required-permission uint))
+    (> (bit-and permissions required-permission) u0))
+
+(define-private (check-case-access (case-id (string-ascii 32)) (entity principal) (required-permission uint))
+    (let
+        ((access-info (map-get? case-access-control {case-id: case-id, entity: entity}))
+         (current-time stacks-block-height))
+        (match access-info
+            info
+                (let
+                    ((is-expired (match (get expires-at info)
+                                     expiry (>= current-time expiry)
+                                     false)))
+                    (and (not is-expired) (has-permission (get permissions info) required-permission)))
+            false)))
+
+(define-public (grant-case-access
+    (case-id (string-ascii 32))
+    (entity principal)
+    (permissions uint)
+    (expires-at (optional uint)))
+    (let
+        ((caller tx-sender)
+         (current-time stacks-block-height)
+         (access-count (default-to u0 (get count (map-get? case-access-counts {case-id: case-id}))))
+         (entity-count (default-to u0 (get count (map-get? entity-access-counts {entity: entity})))))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (> (get-case-count case-id) u0) err-case-not-found)
+        (asserts! (<= permissions permission-full) err-invalid-permission)
+        (asserts! (is-none (map-get? case-access-control {case-id: case-id, entity: entity})) err-permission-exists)
+        (match expires-at
+            expiry (asserts! (> expiry current-time) err-invalid-search)
+            true)
+        (map-set case-access-control
+            {case-id: case-id, entity: entity}
+            {permissions: permissions, granted-by: caller, granted-at: current-time, expires-at: expires-at})
+        (map-set case-access-list
+            {case-id: case-id, access-index: access-count}
+            {entity: entity})
+        (map-set case-access-counts
+            {case-id: case-id}
+            {count: (+ access-count u1)})
+        (map-set entity-case-access
+            {entity: entity, entity-access-index: entity-count}
+            {case-id: case-id})
+        (map-set entity-access-counts
+            {entity: entity}
+            {count: (+ entity-count u1)})
+        (ok true)))
+
+(define-public (revoke-case-access
+    (case-id (string-ascii 32))
+    (entity principal))
+    (let
+        ((caller tx-sender)
+         (access-info (unwrap! (map-get? case-access-control {case-id: case-id, entity: entity}) err-access-denied)))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (or (is-eq caller (get granted-by access-info)) (is-eq caller contract-owner)) err-not-authorized)
+        (ok (map-delete case-access-control {case-id: case-id, entity: entity}))))
+
+(define-public (update-case-permissions
+    (case-id (string-ascii 32))
+    (entity principal)
+    (new-permissions uint))
+    (let
+        ((caller tx-sender)
+         (access-info (unwrap! (map-get? case-access-control {case-id: case-id, entity: entity}) err-access-denied)))
+        (asserts! (is-entity-authorized caller) err-not-registered)
+        (asserts! (<= new-permissions permission-full) err-invalid-permission)
+        (asserts! (or (is-eq caller (get granted-by access-info)) (is-eq caller contract-owner)) err-not-authorized)
+        (map-set case-access-control
+            {case-id: case-id, entity: entity}
+            (merge access-info {permissions: new-permissions}))
+        (ok true)))
+
+(define-read-only (get-case-access (case-id (string-ascii 32)) (entity principal))
+    (map-get? case-access-control {case-id: case-id, entity: entity}))
+
+(define-read-only (has-case-access (case-id (string-ascii 32)) (entity principal) (required-permission uint))
+    (check-case-access case-id entity required-permission))
+
+(define-read-only (get-case-access-list-entry (case-id (string-ascii 32)) (access-index uint))
+    (map-get? case-access-list {case-id: case-id, access-index: access-index}))
+
+(define-read-only (get-case-access-count (case-id (string-ascii 32)))
+    (get count (default-to {count: u0} (map-get? case-access-counts {case-id: case-id}))))
+
+(define-read-only (get-entity-case-access (entity principal) (entity-access-index uint))
+    (map-get? entity-case-access {entity: entity, entity-access-index: entity-access-index}))
+
+(define-read-only (get-entity-access-count (entity principal))
+    (get count (default-to {count: u0} (map-get? entity-access-counts {entity: entity}))))
+
+(define-read-only (is-access-expired (case-id (string-ascii 32)) (entity principal))
+    (match (map-get? case-access-control {case-id: case-id, entity: entity})
+        access-info
+            (match (get expires-at access-info)
+                expiry (>= stacks-block-height expiry)
+                false)
+        true))
